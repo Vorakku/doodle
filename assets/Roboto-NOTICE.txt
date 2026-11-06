@@ -1,0 +1,4 @@
+Roboto font
+Copyright 2011 Google Inc. All Rights Reserved.
+Licensed under the Apache License, Version 2.0.
+Source: samples/data/Roboto-Regular.ttf in the official aardappel/goose v2026.3 release.

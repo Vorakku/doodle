@@ -1,0 +1,2 @@
+c_sources_windows = ["platform/wallpaper_windows.c"];
+c_libs_windows = ["user32"];
