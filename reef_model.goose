@@ -11,7 +11,7 @@ struct Point { x: f32, y: f32, width: f32, color: u8[4], start: bool }
 struct Bounds { x: f32, y: f32, w: f32, h: f32 }
 struct Creature {
     x: f32, y: f32, speed: f32, phase: f32,
-    size: f32 = 0.0, // Zero preserves the size of creatures drawn before the zoomable studio.
+    size: f32 = 0.0, // Drawn size. Zero for creatures drawn before the zoomable studio.
     points: Point[..8192],
 }
 struct LegacyCreature {
@@ -35,22 +35,20 @@ fn sample_stroke(points: Point[>..]&, visible: i64&, drawing: bool&, down: bool,
 }
 
 fn creature_area(fish: const Creature&, w: f32, h: f32) -> Bounds {
-    let size = if fish.size > 0.0 {
-        max(16.0, min(fish.size * max(w, h), min(max(16.0, w - 32.0), max(16.0, h - 220.0))))
-    } else { min(136.0, min(w * 0.2, max(30.0, (h - 160.0) * 0.35))) };
-    let x = size * 0.5 + fish.x * max(0.0, w - size);
-    let top = if fish.size > 0.0 { 112.0 + size * 0.5 } else { 112.0 };
-    let travel = if fish.size > 0.0 { max(0.0, h - 200.0 - size) } else { max(0.0, h - 240.0) };
-    let y = top + fish.y * travel + sin(fish.phase) * 7.0;
-    return Bounds { x - size * 0.5, y - size * 0.5, size, size };
+    // shortcut: every creature gets one fixed size and fish.size is saved but ignored, until the sizing feature.
+    let size = min(136.0, min(w * 0.2, max(30.0, (h - 160.0) * 0.35)));
+    // fish.x runs from fully off the left edge (0) to fully off the right edge (1).
+    let left = fish.x * (w + size) - size;
+    let y = 112.0 + fish.y * max(0.0, h - 240.0) + sin(fish.phase) * 7.0;
+    return Bounds { left, y - size * 0.5, size, size };
 }
 
 fn move_creature(fish: Creature&, cx: f32, cy: f32, w: f32, h: f32) {
     let size = creature_area(fish, w, h).w;
-    fish.x = clamp((cx - size * 0.5) / max(1.0, w - size), 0.05, 0.95);
-    let top = if fish.size > 0.0 { 112.0 + size * 0.5 } else { 112.0 };
-    let travel = if fish.size > 0.0 { max(1.0, h - 200.0 - size) } else { max(1.0, h - 240.0) };
-    fish.y = clamp((cy - top - sin(fish.phase) * 7.0) / travel, 0.1, 0.9);
+    let span = max(1.0, w + size);
+    // Dropped creatures stay fully on screen, where they can be grabbed again.
+    fish.x = clamp((cx + size * 0.5) / span, size / span, w / span);
+    fish.y = clamp((cy - 112.0 - sin(fish.phase) * 7.0) / max(1.0, h - 240.0), 0.1, 0.9);
 }
 
 fn pick_creature(reef: const Creature[:], x: f32, y: f32, w: f32, h: f32) -> i64 {
@@ -85,11 +83,54 @@ fn flip_creature(reef: Creature[>..]&, index: i64, save_path: const u8[:]) -> bo
     return true;
 }
 
-fn update(fish: Creature&, dt: f32) {
-    fish.x += fish.speed * dt;
-    if fish.x >= 0.95 { fish.x = 0.95; fish.speed = -abs(fish.speed); }
-    if fish.x <= 0.05 { fish.x = 0.05; fish.speed = abs(fish.speed); }
+// A creature's heading runs from 0 (facing left) to 1 (facing right). It lives only in memory, so saves are unchanged.
+let TURN_SECONDS: f32 = 1.8;
+
+fn step_heading(heading: f32, speed: f32, dt: f32) -> f32 {
+    return clamp(heading + (if speed < 0.0 { -dt } else { dt }) / TURN_SECONDS, 0.0, 1.0);
+}
+
+// -1 is facing left and 1 is facing right. The cosine is how wide a body looks as it rotates, so turns ease in and out.
+fn turn_facing(heading: f32) -> f32 { return -cos(heading * 3.14159265); }
+
+// A turn rotates the flat drawing around the vertical axis, swinging back into the tank and returning.
+struct TurnView { across: f32, away: f32, lens: f32, depth: f32 }
+
+fn turn_view(heading: f32, size: f32) -> TurnView {
+    let facing = turn_facing(heading);
+    let away = sin(heading * 3.14159265); // 1 when facing straight into the screen.
+    // Mid-turn a creature is seen nearly edge-on, but it should never vanish.
+    return TurnView { across: if facing < 0.0 { min(facing, -0.15) } else { max(facing, 0.15) },
+                      away: away, lens: max(1.0, size * 3.0), depth: size * 1.1 * away };
+}
+
+// Perspective at a spot `along` pixels ahead of the body's centre: further away is smaller.
+fn turn_nearness(turn: TurnView, along: f32) -> f32 {
+    return turn.lens / (turn.lens + turn.depth + along * turn.away);
+}
+
+// Moving with facing rather than speed makes a creature slow to a stop mid-turn, then set off the new way.
+fn update(fish: Creature&, dt: f32, facing: f32) {
+    fish.x += abs(fish.speed) * facing * dt;
+    // Past one edge, back in from the other, still heading the same way.
+    if fish.x > 1.0 { fish.x -= 1.0; }
+    if fish.x < 0.0 { fish.x += 1.0; }
     fish.phase = (fish.phase + dt * 2.5) % 6.2831853;
+}
+
+// Each creature gets a chance to turn every 10-15 seconds, on its own rhythm, and takes about one chance in three.
+// Worked out from the clock so nothing extra is saved, and it can't turn twice in quick succession.
+fn turn_due(index: i64, before: f32, after: f32) -> bool {
+    let every = 10.0 + (index % 5) as f32 * 1.3;
+    let slot = floor(after / every);
+    if slot == floor(before / every) { return false; }
+    let noise = sin(slot * 12.9898 + index * 78.233) * 43758.547;
+    return noise - floor(noise) < 0.33;
+}
+
+fn maybe_turn(fish: Creature&, index: i64, before: f32, after: f32) {
+    // Near an edge it would be flipping half off screen, so let it finish leaving or arriving.
+    if fish.x > 0.15 && fish.x < 0.85 && turn_due(index, before, after) { fish.speed = -fish.speed; }
 }
 
 fn drawing_bounds(points: const Point[:]) -> Bounds {
@@ -104,7 +145,9 @@ fn drawing_bounds(points: const Point[:]) -> Bounds {
         bottom = max(bottom, p.y + p.width * 0.5);
     }
     if points.len == 0 { return Bounds { 0.0, 0.0, 1.0, 1.0 }; }
-    return Bounds { left - 0.02, top - 0.02, right - left + 0.04, bottom - top + 0.04 };
+    // Padding follows the ink, so tiny drawings fill their creature box as fully as big ones.
+    let margin = max(right - left, bottom - top) * 0.03;
+    return Bounds { left - margin, top - margin, right - left + margin * 2.0, bottom - top + margin * 2.0 };
 }
 
 fn valid_points(points: const Point[:]) -> bool {
@@ -141,7 +184,7 @@ fn decode_reef(image: const u8[:]) -> Creature[>..], bool {
         }
     } else { return [], false; }
     for fish in reef {
-        if !valid_points(fish.points) || !(fish.x >= 0.05 && fish.x <= 0.95 &&
+        if !valid_points(fish.points) || !(fish.x >= 0.0 && fish.x <= 1.0 &&
             fish.y >= 0.1 && fish.y <= 0.9 && abs(fish.speed) <= 0.2 &&
             fish.phase >= 0.0 && fish.phase <= 6.284 && fish.size >= 0.0 && fish.size <= 1.0) { return [], false; }
     }

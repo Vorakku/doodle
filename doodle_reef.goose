@@ -7,10 +7,18 @@ import ui;
 import reef_model;
 import wallpaper_platform;
 import canvas_view;
+import reef_fill;
+import reef_color;
+import reef_shapes;
 
 let FONT: const u8[:] = embed_file("assets/Roboto-Regular.ttf");
 let PALETTE: u8[4][6] = [[255, 190, 108, 255], [255, 126, 140, 255],
     [129, 218, 195, 255], [143, 187, 255, 255], [207, 162, 243, 255], [242, 245, 232, 255]];
+
+let SWATCHES: u8[4][8] = [[255, 190, 108, 255], [255, 126, 140, 255], [129, 218, 195, 255], [143, 187, 255, 255],
+    [207, 162, 243, 255], [242, 245, 232, 255], [255, 228, 92, 255], [18, 26, 34, 255]];
+let RAIL_TOOLS: Tool[10] = [Tool.Draw, Tool.Fill, Tool.Line, Tool.Rectangle, Tool.Circle,
+    Tool.Triangle, Tool.Diamond, Tool.Hexagon, Tool.Star, Tool.Heart];
 
 fn color(c: u8[4]) -> ui::Color { ui::Color { c[0], c[1], c[2], c[3] } }
 
@@ -19,20 +27,83 @@ fn text(ctx: ui::Context, x: f32, y: f32, w: f32, message: const u8[:], c: ui::C
                   ui::rgba(0, 0, 0, 0), c);
 }
 
+// The body bends harder while turning.
+fn wave_height(facing: f32) -> f32 { return 3.0 + (1.0 - abs(facing)) * 5.0; }
+
+// Pieces share fixed positions along the drawing, so every row bends with the swim wave identically and no seam opens.
+fn draw_fill_row(ctx: ui::Context, x0: f32, x1: f32, y: f32, height: f32, b: Bounds, scale: f32, ox: f32, oy: f32,
+                 phase: f32, swim: bool, turn: TurnView, clip: Bounds, c: ui::Color) {
+    let left = min(x0, x1);
+    let right = max(x0, x1);
+    let step = if swim { b.w / 6.0 } else { max(1.0, right - left + 1.0) };
+    var piece = if swim { floor((left - b.x) / step) as! i64 } else { 0 };
+    var start = left;
+    while start < right {
+        let end = if swim { min(right, b.x + (piece + 1) * step) } else { right };
+        let wave = if swim { sin(phase + (piece + 0.5) * step / b.w * 3.0) * wave_height(turn.across) } else { 0.0 };
+        let along0 = (start - b.x - b.w * 0.5) * scale;
+        let along1 = (end - b.x - b.w * 0.5) * scale;
+        let middle = ox + b.w * scale * 0.5;
+        let edge0 = middle + along0 * turn.across * turn_nearness(turn, along0);
+        let edge1 = middle + along1 * turn.across * turn_nearness(turn, along1);
+        let sx0 = floor(min(edge0, edge1));
+        let sx1 = ceil(max(edge0, edge1));
+        let near = turn_nearness(turn, (along0 + along1) * 0.5);
+        let sy = oy + b.h * scale * 0.5 + ((y - b.y - b.h * 0.5) * scale + wave) * near;
+        let bar = intersect_area(Bounds { sx0, floor(sy), sx1 - sx0, ceil(height * near) }, clip);
+        if bar.w > 0.0 && bar.h > 0.0 { ui::fill_rect(ctx, ui::rect(bar.x, bar.y, bar.w, bar.h), 0.0, c); }
+        start = end;
+        piece++;
+    }
+}
+
+// Fills go underneath all the lines, so outlines stay crisp and hide the fill's stepped edge.
+fn draw_fills(ctx: ui::Context, points: const Point[:], b: Bounds, scale: f32, ox: f32, oy: f32,
+              phase: f32, swim: bool, turn: TurnView, clip: Bounds) {
+    // Small swimming fish have several rows per pixel, and skipping the extras keeps the wallpaper cheap.
+    let min_step: f32 = if swim { 1.0 } else { 0.0 };
+    var row_start: f32 = 0.0;
+    var row_y: f32 = -1.0;
+    var kept: f32 = -1.0e9;
+    var draw_row = true;
+    for p in points {
+        let row_height = fill_row_height(p.width);
+        if row_height == 0.0 { continue; }
+        if !p.start {
+            let height = ceil(max(row_height * scale, min_step + 1.0));
+            if draw_row { draw_fill_row(ctx, row_start, p.x, p.y, height, b, scale, ox, oy, phase, swim, turn, clip, color(p.color)); }
+            continue;
+        }
+        row_start = p.x;
+        if p.y != row_y {
+            row_y = p.y;
+            let px = p.y * scale;
+            draw_row = px < kept || px >= kept + min_step;
+            if draw_row { kept = px; }
+        }
+    }
+}
+
 fn draw_points(ctx: ui::Context, points: const Point[:], area: ui::Rect,
-               phase: f32, swim: bool, flip: bool,
+               phase: f32, swim: bool, heading: f32,
                document: Bounds = Bounds { 0.0, 0.0, 1.0, 1.0 },
                clip: Bounds = Bounds { 0.0, 0.0, 16384.0, 16384.0 }) {
     let b = if swim { drawing_bounds(points) } else { document };
     let scale = min(area.w / b.w, area.h / b.h);
+    let turn = turn_view(heading, area.w);
     let ox = area.x + (area.w - b.w * scale) * 0.5;
     let oy = area.y + (area.h - b.h * scale) * 0.5;
+    draw_fills(ctx, points, b, scale, ox, oy, phase, swim, turn, clip);
     var last = float2 { 0.0, 0.0 };
     for p in points {
-        let x = ox + (if flip { b.x + b.w - p.x } else { p.x - b.x }) * scale;
-        let y = oy + (p.y - b.y) * scale +
-            (if swim { sin(phase + (p.x - b.x) / b.w * 3.0) * 3.0 } else { 0.0 });
-        let width = max(1.0, p.width * scale);
+        if fill_row_height(p.width) > 0.0 { continue; }
+        let along = (p.x - b.x - b.w * 0.5) * scale;
+        let near = turn_nearness(turn, along);
+        let x = ox + b.w * scale * 0.5 + along * turn.across * near;
+        let y = oy + b.h * scale * 0.5 + near * ((p.y - b.y - b.h * 0.5) * scale +
+            (if swim { sin(phase + (p.x - b.x) / b.w * 3.0) * wave_height(turn.across) } else { 0.0 }));
+        // Whole pixels, because line widths get truncated and would come out thinner than the round joints.
+        let width = max(1.0, round(p.width * scale * near));
         if !p.start {
             let ax, ay, bx, by, visible = clip_line(last.x, last.y, x, y, clip, width * 0.5);
             if visible { ui::stroke_line(ctx, ax, ay, bx, by, width, color(p.color)); }
@@ -60,7 +131,115 @@ fn demo() -> Creature {
     return fish;
 }
 
-fn scene(ctx: ui::Context, w: f32, h: f32, time: f32, reef: const Creature[:], selected_fish: i64,
+// Coordinates are 0..1 inside the box.
+fn icon_path(ctx: ui::Context, box: ui::Rect, path: const f32[2][:], closed: bool, thickness: f32, c: ui::Color) {
+    var mapped: float2[>..] = [];
+    for p in path { mapped.push(float2 { box.x + p[0] * box.w, box.y + p[1] * box.h }); }
+    if closed { ui::stroke_polygon(ctx, mapped, thickness, c); } else { ui::stroke_polyline(ctx, mapped, thickness, c); }
+}
+
+fn icon_box(slot: ui::Rect, margin: f32) -> ui::Rect {
+    let size = max(4.0, min(slot.w, slot.h) - margin * 2.0);
+    return ui::rect(slot.x + (slot.w - size) * 0.5, slot.y + (slot.h - size) * 0.5, size, size);
+}
+
+fn draw_pencil_icon(ctx: ui::Context, box: ui::Rect, c: ui::Color) {
+    let body: f32[2][5] = [[0.72, 0.06], [0.94, 0.28], [0.32, 0.90], [0.06, 0.94], [0.10, 0.68]];
+    let band: f32[2][2] = [[0.58, 0.20], [0.80, 0.42]];
+    icon_path(ctx, box, body, true, 2.0, c);
+    icon_path(ctx, box, band, false, 2.0, c);
+}
+
+fn draw_bucket_icon(ctx: ui::Context, box: ui::Rect, c: ui::Color) {
+    let can: f32[2][4] = [[0.40, 0.14], [0.80, 0.54], [0.44, 0.90], [0.04, 0.50]];
+    let handle: f32[2][2] = [[0.40, 0.14], [0.26, 0.00]];
+    let level: f32[2][2] = [[0.08, 0.50], [0.76, 0.50]];
+    icon_path(ctx, box, can, true, 2.0, c);
+    icon_path(ctx, box, handle, false, 2.0, c);
+    icon_path(ctx, box, level, false, 2.0, c);
+    ui::fill_circle(ctx, ui::rect(box.x + box.w * 0.80, box.y + box.h * 0.70, box.w * 0.20, box.h * 0.24), c);
+}
+
+fn draw_dropper_icon(ctx: ui::Context, box: ui::Rect, c: ui::Color) {
+    let tube: f32[2][5] = [[0.60, 0.26], [0.74, 0.40], [0.26, 0.88], [0.08, 0.92], [0.12, 0.74]];
+    let collar: f32[2][2] = [[0.50, 0.16], [0.84, 0.50]];
+    icon_path(ctx, box, tube, true, 2.0, c);
+    icon_path(ctx, box, collar, false, 2.5, c);
+    ui::fill_circle(ctx, ui::rect(box.x + box.w * 0.62, box.y + box.h * 0.04, box.w * 0.34, box.h * 0.34), c);
+}
+
+fn draw_tool_icon(ctx: ui::Context, tool: Tool, slot: ui::Rect, active: bool) {
+    if active { ui::fill_rect(ctx, slot, 4.0, ui::rgb(129, 218, 195)); }
+    let c = if active { ui::rgb(12, 38, 44) } else { ui::rgb(224, 238, 230) };
+    let box = icon_box(slot, 9.0);
+    if tool == Tool.Draw { draw_pencil_icon(ctx, box, c); }
+    else if tool == Tool.Fill { draw_bucket_icon(ctx, box, c); }
+    else {
+        // Icon points snap to whole pixels, so curves look smoother with fewer of them.
+        let stride = if tool == Tool.Circle || tool == Tool.Heart { 4 } else { 1 };
+        let outline = shape_outline(tool);
+        var mapped: float2[>..] = [];
+        for i in outline.len {
+            if i % stride == 0 { mapped.push(float2 { box.x + outline[i].x * box.w, box.y + outline[i].y * box.h }); }
+        }
+        ui::stroke_polyline(ctx, mapped, 2.0, c);
+    }
+}
+
+// The saturation and brightness square, with the white ring from the picker it's modelled on.
+fn color_square(ctx: ui::Context, picked: Hsv&, dragging: i64&) {
+    ui::layout_row_dynamic(ctx, 160.0, 1);
+    let state, slot = ui::widget(ctx);
+    let mouse = ui::input_mouse(ctx).pos;
+    if state == ui::WIDGET_VALID && ui::input_is_mouse_pressed(ctx, ui::BUTTON_LEFT) &&
+       ui::input_is_mouse_hovering_rect(ctx, slot) { dragging = 1; }
+    if dragging == 1 {
+        picked.s = clamp((mouse.x - slot.x) / max(1.0, slot.w), 0.0, 1.0);
+        picked.v = 1.0 - clamp((mouse.y - slot.y) / max(1.0, slot.h), 0.0, 1.0);
+    }
+    let hue = color(hsv_to_rgb(Hsv { picked.h, 1.0, 1.0 }));
+    let white = ui::rgb(255, 255, 255);
+    let clear = ui::rgba(0, 0, 0, 0);
+    let black = ui::rgb(0, 0, 0);
+    ui::fill_rect_multi_color(ctx, slot, white, hue, hue, white);
+    ui::fill_rect_multi_color(ctx, slot, clear, clear, black, black);
+    let x = slot.x + picked.s * slot.w;
+    let y = slot.y + (1.0 - picked.v) * slot.h;
+    ui::fill_circle(ctx, ui::rect(x - 8.0, y - 8.0, 16.0, 16.0), white);
+    ui::fill_circle(ctx, ui::rect(x - 5.0, y - 5.0, 10.0, 10.0), color(hsv_to_rgb(picked)));
+}
+
+fn hue_slider(ctx: ui::Context, picked: Hsv&, dragging: i64&) {
+    let state, slot = ui::widget(ctx);
+    let mouse = ui::input_mouse(ctx).pos;
+    if state == ui::WIDGET_VALID && ui::input_is_mouse_pressed(ctx, ui::BUTTON_LEFT) &&
+       ui::input_is_mouse_hovering_rect(ctx, slot) { dragging = 2; }
+    if dragging == 2 { picked.h = clamp((mouse.x - slot.x) / max(1.0, slot.w), 0.0, 1.0); }
+    for i in 6 {
+        let a = color(hsv_to_rgb(Hsv { i / 6.0, 1.0, 1.0 }));
+        let b = color(hsv_to_rgb(Hsv { (i + 1) / 6.0, 1.0, 1.0 }));
+        let bar = ui::rect(slot.x + slot.w * i / 6.0, slot.y + 4.0, slot.w / 6.0 + 1.0, max(1.0, slot.h - 8.0));
+        ui::fill_rect_multi_color(ctx, bar, a, b, b, a);
+    }
+    let x = slot.x + picked.h * slot.w;
+    let y = slot.y + slot.h * 0.5;
+    ui::fill_circle(ctx, ui::rect(x - 9.0, y - 9.0, 18.0, 18.0), ui::rgb(255, 255, 255));
+    ui::fill_circle(ctx, ui::rect(x - 6.0, y - 6.0, 12.0, 12.0), color(hsv_to_rgb(Hsv { picked.h, 1.0, 1.0 })));
+}
+
+// Colours already in the drawing, oldest first, so they're easy to reuse.
+fn used_colors(points: const Point[:]) -> u8[4][>..] {
+    var found: u8[4][>..] = [];
+    for p in points {
+        var known = false;
+        for c in found { if c == p.color { known = true; } }
+        if !known { found.push(p.color); }
+        if found.len == 8 { break; }
+    }
+    return found;
+}
+
+fn scene(ctx: ui::Context, w: f32, h: f32, time: f32, reef: const Creature[:], headings: const f32[:], selected_fish: i64,
          wallpaper: bool = false) {
     let bounds = ui::rect(0.0, 0.0, w, h);
     ui::window_set_bounds(ctx, "Water", bounds);
@@ -99,12 +278,16 @@ fn scene(ctx: ui::Context, w: f32, h: f32, time: f32, reef: const Creature[:], s
                 }
             }
         }
-        for i in reef.len {
-            let fish .= reef[i];
-            let area = creature_area(fish, w, h);
-            let box = ui::rect(area.x, area.y, area.w, area.h);
-            if i == selected_fish { ui::stroke_rect(ctx, box, 10.0, 2.0, ui::rgb(129, 218, 195)); }
-            draw_points(ctx, fish.points, box, fish.phase, true, fish.speed < 0.0);
+        // Turning creatures are further back, so they go behind the others.
+        for pass in 2 {
+            for i in reef.len {
+                if (headings[i] > 0.0 && headings[i] < 1.0) != (pass == 0) { continue; }
+                let fish .= reef[i];
+                let area = creature_area(fish, w, h);
+                let box = ui::rect(area.x, area.y, area.w, area.h);
+                if i == selected_fish { ui::stroke_rect(ctx, box, 10.0, 2.0, ui::rgb(129, 218, 195)); }
+                draw_points(ctx, fish.points, box, fish.phase, true, headings[i]);
+            }
         }
         if !wallpaper { text(ctx, 26.0, h - 32.0, w - 52.0, "A little ocean. Entirely yours.", ui::rgb(42, 61, 58)); }
     }
@@ -165,11 +348,21 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
     colors[ui::COLOR_BUTTON] = ui::rgb(38, 89, 94);
     colors[ui::COLOR_BUTTON_HOVER] = ui::rgb(49, 117, 118);
     colors[ui::COLOR_BUTTON_ACTIVE] = ui::rgb(67, 137, 130);
+    colors[ui::COLOR_TOGGLE_CURSOR] = ui::rgb(129, 218, 195);
     ui::style_from_table(ctx, colors);
 
     var points: Point[>..] = [];
+    var fills: FillRange[>..] = [];
+    var tool = Tool.Draw;
+    var picked = rgb_to_hsv(SWATCHES[0], 0.0);
+    var color_drag = 0;
+    var picking_color = false;
+    var hex_text: u8[..6] = [];
+    var hex_editing = false;
+    var shape_active = false;
+    var shape_x: f32 = 0.0;
+    var shape_y: f32 = 0.0;
     var visible = 0;
-    var selected = 0;
     var selected_fish = -1;
     var dragging_fish = -1;
     var grab_x: f32 = 0.0;
@@ -183,6 +376,7 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
     var canvas_extent: f32 = 1100.0;
     var panning = false;
     var time: f32 = 0.0;
+    var headings: f32[>..] = [];
     var drawn = 0;
     var next_reload = clock() + 1.0;
     loop {
@@ -224,8 +418,9 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                         else if !write_file_atomic(save_path, encode_reef(reef)) {
                             status.append("Could not save the aquarium. Your desktop background was not changed.");
                         } else if reef_set_background(directory) {
-                            status.append("Opening Lively to apply your aquarium. Complete setup there if prompted.");
-                        } else { status.append("Could not start wallpaper setup. Rebuild the app and try again."); }
+                            status.append(if reef_background_uses_lively() { "Opening Lively to apply your aquarium. Complete setup there if prompted." }
+                                          else { "Your aquarium is now the desktop background." });
+                        } else { status.append("Could not set the desktop background. Rebuild the app or check the terminal, then try again."); }
                     }
                 } else { ui::label(ctx, "DOODLE REEF", ui::TEXT_LEFT); }
                 if ui::button_label(ctx, if studio { "Back to aquarium" } else { "Draw a creature" }) { studio = !studio; drawing = false; }
@@ -242,7 +437,28 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     canvas_extent = max(w, h);
                 }
                 let document = canvas_document(canvas_aspect);
-                let canvas_panel = ui::rect(20.0, 98.0, max(120.0, w - 300.0), max(96.0, h - 194.0));
+                let ink = hsv_to_rgb(picked);
+                let brush_width = clamp(brush / canvas_extent, 0.00001, 0.1);
+
+                let rail = ui::rect(20.0, 98.0, 60.0, max(96.0, h - 194.0));
+                ui::window_set_bounds(ctx, "Tools", rail);
+                if ui::begin(ctx, "Tools", rail, ui::WINDOW_SCROLL_AUTO_HIDE) {
+                    for t in RAIL_TOOLS {
+                        // A gap between painting tools and shapes.
+                        if t == Tool.Line { ui::layout_row_dynamic(ctx, 6.0, 1); let gap_state, gap_slot = ui::widget(ctx); }
+                        ui::layout_row_dynamic(ctx, 38.0, 1);
+                        let slot = ui::widget_bounds(ctx);
+                        if ui::button_label(ctx, "") {
+                            tool = t; picking_color = false; shape_active = false; drawing = false;
+                            if save_ok { status.clear(); }
+                        }
+                        draw_tool_icon(ctx, t, slot, tool == t && !picking_color);
+                        if ui::input_is_mouse_hovering_rect(ctx, slot) { ui::tooltip(ctx, tool_name(t)); }
+                    }
+                }
+                ui::end(ctx);
+
+                let canvas_panel = ui::rect(92.0, 98.0, max(120.0, w - 404.0), max(96.0, h - 194.0));
                 var viewport = Bounds { canvas_panel.x, canvas_panel.y, canvas_panel.w, canvas_panel.h };
                 ui::window_set_bounds(ctx, "Drawing canvas", canvas_panel);
                 if ui::begin(ctx, "Drawing canvas", canvas_panel, ui::WINDOW_NO_SCROLLBAR) {
@@ -260,7 +476,7 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     if !pan_down { panning = false; }
                     if over_view && state == ui::WIDGET_VALID &&
                        (ui::input_is_mouse_pressed(ctx, ui::BUTTON_MIDDLE) || (pressed && gfx::key_down("Space"))) {
-                        panning = true; drawing = false;
+                        panning = true; drawing = false; shape_active = false;
                     }
                     if over_view && mouse.scroll_delta.y != 0.0 {
                         let zoom_step: f32 = 1.2;
@@ -272,11 +488,50 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     let canvas = canvas_area(canvas_view, viewport, document);
                     let inside = over_view && mouse.pos.x >= canvas.x && mouse.pos.x <= canvas.x + canvas.w &&
                                  mouse.pos.y >= canvas.y && mouse.pos.y <= canvas.y + canvas.h;
-                    if !panning {
-                        sample_stroke(points, visible, drawing, down, pressed, inside && state == ui::WIDGET_VALID,
-                            (mouse.pos.x - canvas.x) / canvas.w * document.w,
-                            (mouse.pos.y - canvas.y) / canvas.h * document.h,
-                            clamp(brush / canvas_extent, 0.00001, 0.1), PALETTE[selected]);
+                    let doc_x = (mouse.pos.x - canvas.x) / canvas.w * document.w;
+                    let doc_y = (mouse.pos.y - canvas.y) / canvas.h * document.h;
+                    let can_use = inside && state == ui::WIDGET_VALID;
+                    var shape_end_x = clamp(doc_x, 0.0, document.w);
+                    var shape_end_y = clamp(doc_y, 0.0, document.h);
+                    if tool != Tool.Line && (gfx::key_down("Left Shift") || gfx::key_down("Right Shift")) {
+                        shape_end_x, shape_end_y = constrain_square(shape_x, shape_y, shape_end_x, shape_end_y, document);
+                    }
+                    if !panning && picking_color {
+                        drawing = false;
+                        if pressed && can_use {
+                            let found_color, found = color_at(points[..visible], doc_x, doc_y);
+                            if found { picked = rgb_to_hsv(found_color, picked.h); picking_color = false; }
+                            if save_ok {
+                                status.clear();
+                                if !found { status.append("No color there. Click on part of your drawing."); }
+                            }
+                        }
+                    } else if !panning && tool == Tool.Fill {
+                        drawing = false;
+                        if pressed && can_use {
+                            let result = fill_region(points, visible, fills, document, doc_x, doc_y, ink);
+                            if save_ok {
+                                status.clear();
+                                if result == FillResult.OpenShape { status.append("That spot isn't enclosed. Close the gap in your outline, then try again."); }
+                                else if result == FillResult.OnInk { status.append("Click inside the shape, not on its outline."); }
+                                else if result == FillResult.NoRoom { status.append("Not enough drawing points left for this fill. Undo something first."); }
+                            }
+                        }
+                    } else if !panning && is_shape(tool) {
+                        drawing = false;
+                        if pressed && can_use {
+                            shape_active = true; shape_x = doc_x; shape_y = doc_y;
+                        } else if shape_active && !down {
+                            shape_active = false;
+                            let added = add_shape(points, visible, fills, tool, shape_x, shape_y, shape_end_x, shape_end_y, brush_width, ink);
+                            if save_ok {
+                                status.clear();
+                                if !added { status.append("Not enough drawing points left for this shape. Undo something first."); }
+                            }
+                        }
+                    } else if !panning {
+                        if pressed && can_use { drop_undone_fills(fills, visible); }
+                        sample_stroke(points, visible, drawing, down, pressed, can_use, doc_x, doc_y, brush_width, ink);
                     }
                     ui::push_scissor(ctx, ui::rect(viewport.x, viewport.y, viewport.w, viewport.h));
                     ui::fill_rect(ctx, ui::rect(viewport.x, viewport.y, viewport.w, viewport.h), 0.0, ui::rgb(10, 26, 34));
@@ -294,20 +549,57 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     }
                     let ink_clip = intersect_area(canvas, viewport);
                     ui::push_scissor(ctx, ui::rect(ink_clip.x, ink_clip.y, ink_clip.w, ink_clip.h));
-                    draw_points(ctx, points[..visible], ui::rect(canvas.x, canvas.y, canvas.w, canvas.h),
-                                0.0, false, false, document, ink_clip);
+                    let canvas_box = ui::rect(canvas.x, canvas.y, canvas.w, canvas.h);
+                    draw_points(ctx, points[..visible], canvas_box, 0.0, false, 1.0, document, ink_clip);
+                    if shape_active {
+                        draw_points(ctx, shape_points(tool, shape_x, shape_y, shape_end_x, shape_end_y, brush_width, ink),
+                                    canvas_box, 0.0, false, 1.0, document, ink_clip);
+                    }
                 }
                 ui::end(ctx);
 
-                let tools = ui::rect(max(20.0, w - 260.0), 98.0, 240.0, max(96.0, h - 194.0));
+                let tools = ui::rect(max(92.0, w - 300.0), 98.0, 280.0, max(96.0, h - 194.0));
                 ui::window_set_bounds(ctx, "Studio tools", tools);
-                if ui::begin(ctx, "Studio tools", tools, 0) {
-                    ui::layout_row_dynamic(ctx, 28.0, 1);
-                    ui::label(ctx, "DRAWING STUDIO", ui::TEXT_LEFT);
-                    ui::layout_row_dynamic(ctx, 22.0, 1);
-                    ui::label(ctx, "Aquarium-sized canvas", ui::TEXT_LEFT);
-                    ui::layout_row_dynamic(ctx, 26.0, 6);
-                    for i in 6 { if ui::button_color(ctx, color(PALETTE[i])) { selected = i; } }
+                if ui::begin(ctx, "Studio tools", tools, ui::WINDOW_SCROLL_AUTO_HIDE) {
+                    if !ui::input_is_mouse_down(ctx, ui::BUTTON_LEFT) { color_drag = 0; }
+                    color_square(ctx, picked, color_drag);
+
+                    let hue_ratios: f32[2] = [0.16, 0.84];
+                    ui::layout_row(ctx, ui::DYNAMIC, 26.0, hue_ratios);
+                    let dropper_slot = ui::widget_bounds(ctx);
+                    if ui::button_label(ctx, "") {
+                        picking_color = !picking_color; shape_active = false; drawing = false;
+                        if save_ok { status.clear(); if picking_color { status.append("Click on your drawing to pick up its color."); } }
+                    }
+                    if picking_color { ui::fill_rect(ctx, dropper_slot, 4.0, ui::rgb(129, 218, 195)); }
+                    draw_dropper_icon(ctx, icon_box(dropper_slot, 4.0), if picking_color { ui::rgb(12, 38, 44) } else { ui::rgb(224, 238, 230) });
+                    if ui::input_is_mouse_hovering_rect(ctx, dropper_slot) { ui::tooltip(ctx, "Pick a color from your drawing"); }
+                    hue_slider(ctx, picked, color_drag);
+
+                    let hex_ratios: f32[2] = [0.16, 0.84];
+                    ui::layout_row(ctx, ui::DYNAMIC, 30.0, hex_ratios);
+                    let preview = ui::widget_bounds(ctx);
+                    ui::spacing(ctx, 1);
+                    ui::fill_rect(ctx, preview, 4.0, color(hsv_to_rgb(picked)));
+                    if !hex_editing { hex_text.clear(); hex_text.append(color_hex(hsv_to_rgb(picked))); }
+                    let hex_state = ui::edit_string(ctx, ui::EDIT_FIELD | ui::EDIT_SIG_ENTER, hex_text, ui::FILTER_HEX);
+                    hex_editing = (hex_state & ui::EDIT_ACTIVE) != 0;
+                    if hex_editing {
+                        let typed, typed_ok = parse_hex(hex_text);
+                        if typed_ok { picked = rgb_to_hsv(typed, picked.h); }
+                    }
+                    if (hex_state & ui::EDIT_COMMITTED) != 0 { ui::edit_unfocus(ctx); }
+
+                    ui::layout_row_dynamic(ctx, 26.0, 8);
+                    for c in SWATCHES { if ui::button_color(ctx, color(c)) { picked = rgb_to_hsv(c, picked.h); } }
+                    ui::layout_row_dynamic(ctx, 20.0, 1);
+                    ui::label(ctx, "In this drawing", ui::TEXT_LEFT);
+                    ui::layout_row_dynamic(ctx, 26.0, 8);
+                    let used = used_colors(points[..visible]);
+                    for c in used { if ui::button_color(ctx, color(c)) { picked = rgb_to_hsv(c, picked.h); } }
+                    // An empty widget, because spacing here adds a phantom row and pushes the panel down.
+                    for i in 8 - used.len { let empty_state, empty_slot = ui::widget(ctx); }
+
                     ui::layout_row_dynamic(ctx, 26.0, 1);
                     ui::property_int(ctx, "Brush size", 2, brush, 24, 1, 1.0);
                     ui::layout_row_dynamic(ctx, 30.0, 3);
@@ -324,16 +616,14 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     ui::label(ctx, str(round(canvas_view.zoom * 100.0) as! i64, "% / Scroll to zoom"), ui::TEXT_LEFT);
                     ui::label(ctx, "Middle drag / Space + drag", ui::TEXT_LEFT);
                     ui::layout_row_dynamic(ctx, 30.0, 3);
-                    if ui::button_label(ctx, "Undo") && visible > 0 {
-                        visible--;
-                        while visible > 0 && !points[visible].start { visible--; }
-                    }
-                    if ui::button_label(ctx, "Redo") && visible < points.len {
-                        visible++;
-                        while visible < points.len && !points[visible].start { visible++; }
-                    }
+                    // Not mid-stroke, where the next mouse sample would bring the undone points straight back.
+                    let shortcuts = (gfx::key_down("Left Ctrl") || gfx::key_down("Right Ctrl")) && !drawing && !shape_active && !ui::wants_keyboard(ctx);
+                    let undo_clicked = ui::button_label(ctx, "Undo");
+                    let redo_clicked = ui::button_label(ctx, "Redo");
+                    if (undo_clicked || (shortcuts && gfx::key_pressed("Z"))) && visible > 0 { visible = undo_position(points, visible, fills); }
+                    if (redo_clicked || (shortcuts && gfx::key_pressed("Y"))) && visible < points.len { visible = redo_position(points, visible, fills); }
                     if ui::button_label(ctx, "Clear") {
-                        points.resize(0); visible = 0; canvas_aspect = 0.0; canvas_view = CanvasView {}; drawing = false;
+                        points.resize(0); fills.clear(); visible = 0; canvas_aspect = 0.0; canvas_view = CanvasView {}; drawing = false; shape_active = false;
                     }
                     ui::layout_row_dynamic(ctx, 38.0, 1);
                     if visible == 0 || reef.len >= MAX_CREATURES || !save_ok { ui::widget_disable_begin(ctx); }
@@ -347,7 +637,7 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                         fish.size = min(1.0, max(ink_bounds.w, ink_bounds.h));
                         reef.push(fish);
                         if write_file_atomic(save_path, encode_reef(reef)) {
-                            points.resize(0); visible = 0; studio = false; paused = false;
+                            points.resize(0); fills.clear(); visible = 0; studio = false; paused = false;
                             canvas_aspect = 0.0; canvas_view = CanvasView {}; drawing = false; panning = false;
                             status.clear(); status.append("Your doodle is swimming. Saved on this computer.");
                         } else {
@@ -364,7 +654,7 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     ui::label(ctx, "Bigger drawing, bigger creature.", ui::TEXT_LEFT);
                 }
                 ui::end(ctx);
-            }
+            } else { shape_active = false; picking_color = false; }
 
             let has_selection = !studio && selected_fish >= 0 && selected_fish < reef.len;
             var want_delete = has_selection && save_ok && gfx::key_pressed("Delete") && !ui::wants_keyboard(ctx);
@@ -428,15 +718,24 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                 } else { status.append("Could not save deletion. Your creature has been kept; try again."); }
             } else if want_flip {
                 status.clear();
-                if flip_creature(reef, selected_fish, save_path) { status.append("Creature flipped and saved. It will keep turning at the walls."); }
+                if flip_creature(reef, selected_fish, save_path) { status.append("Creature flipped and saved. It will keep facing the way it swims."); }
                 else { status.append("Could not save the flip. Your creature has been kept unchanged; try again."); }
             }
         }
-        if !paused {
-            time += dt;
-            for i in reef.len { if i != dragging_fish { update(reef[i], dt); } }
+        // Creatures were added or removed, so positions no longer line up: settle everyone straight away.
+        if headings.len != reef.len {
+            headings.resize(0);
+            for fish in reef { headings.push(if fish.speed < 0.0 { 0.0 } else { 1.0 }); }
         }
-        scene(ctx, w, h, time, reef, if studio || wallpaper { -1 } else { selected_fish }, wallpaper);
+        if !paused {
+            let before = time;
+            time += dt;
+            for i in reef.len {
+                headings[i] = step_heading(headings[i], reef[i].speed, dt);
+                if i != dragging_fish { update(reef[i], dt, turn_facing(headings[i])); maybe_turn(reef[i], i, before, time); }
+            }
+        }
+        scene(ctx, w, h, time, reef, headings, if studio || wallpaper { -1 } else { selected_fish }, wallpaper);
         gfx::begin_screen(float4 { 0.03, 0.1, 0.14, 1.0 });
         gfx::end_pass();
         ui::render(ctx);

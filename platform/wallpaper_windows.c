@@ -51,6 +51,7 @@ uint8_t reef_wallpaper_alive(void) { return reef_window && IsWindow(reef_window)
 void reef_wallpaper_stop(void) { reef_window = NULL; }
 
 uint8_t reef_background_button_available(void) { return 1; }
+uint8_t reef_background_uses_lively(void) { return 1; }
 
 uint8_t reef_set_background(ReefBytes data_directory) {
     wchar_t script[4096], directory[4096], previous[4096], powershell[MAX_PATH], command[9000];

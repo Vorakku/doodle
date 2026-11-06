@@ -2,9 +2,13 @@
 #include <wayland-client.h>
 #include <poll.h>
 #include <errno.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "wlr-layer-shell-client-protocol.h"
 
 typedef struct { const uint8_t *data; int64_t len; } ReefBytes;
@@ -209,5 +213,26 @@ void reef_wallpaper_stop(void) {
     memset(&reef, 0, sizeof reef);
 }
 
-uint8_t reef_background_button_available(void) { return 0; }
-uint8_t reef_set_background(ReefBytes directory) { (void)directory; return 0; }
+uint8_t reef_background_button_available(void) { return getenv("HYPRLAND_INSTANCE_SIGNATURE") != NULL; }
+uint8_t reef_background_uses_lively(void) { return 0; }
+
+/* Runs the helper beside this executable and waits, so the editor can report whether it worked. */
+uint8_t reef_set_background(ReefBytes directory) {
+    extern char **environ;
+    static const char helper[] = "set-background-linux.sh";
+    char script[4096], data[4096];
+    ssize_t count = readlink("/proc/self/exe", script, sizeof script - sizeof helper);
+    if (count <= 0 || directory.len <= 0 || directory.len >= (int64_t)sizeof data) return 0;
+    script[count] = '\0';
+    char *slash = strrchr(script, '/');
+    if (!slash) return 0;
+    memcpy(slash + 1, helper, sizeof helper);
+    memcpy(data, directory.data, (size_t)directory.len);
+    data[directory.len] = '\0';
+    char *argv[] = { script, data, NULL };
+    pid_t pid;
+    if (posix_spawn(&pid, script, NULL, NULL, argv, environ)) return 0;
+    int status;
+    while (waitpid(pid, &status, 0) < 0) { if (errno != EINTR) return 0; }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
