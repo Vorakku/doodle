@@ -30,6 +30,34 @@ if (-not $editbin) { throw 'Visual Studio editbin.exe was not found.' }
 $appPath = Join-Path $PSScriptRoot 'build\doodle_reef.exe'
 & $editbin /NOLOGO /SUBSYSTEM:WINDOWS $appPath
 if ($LASTEXITCODE -ne 0) { throw 'Could not configure the Windows GUI executable.' }
+# Goose can't link a .res, so add the icon afterward. SDL uses the exe's first icon for its window too.
+Add-Type @'
+using System; using System.ComponentModel; using System.IO; using System.Runtime.InteropServices;
+public static class ExeIcon {
+    [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr BeginUpdateResourceW(string file, bool deleteExisting);
+    [DllImport("kernel32", SetLastError = true)] static extern bool UpdateResourceW(IntPtr h, IntPtr type, IntPtr name, ushort lang, byte[] data, uint size);
+    [DllImport("kernel32", SetLastError = true)] static extern bool EndUpdateResourceW(IntPtr h, bool discard);
+    public static void Set(string exe, string ico) {
+        byte[] file = File.ReadAllBytes(ico);
+        int count = BitConverter.ToUInt16(file, 4);
+        byte[] group = new byte[6 + count * 14];
+        Array.Copy(file, group, 6);
+        IntPtr h = BeginUpdateResourceW(exe, false);
+        if (h == IntPtr.Zero) throw new Win32Exception();
+        for (int i = 0; i < count; i++) {
+            int entry = 6 + i * 16;
+            byte[] image = new byte[BitConverter.ToInt32(file, entry + 8)];
+            Array.Copy(file, BitConverter.ToInt32(file, entry + 12), image, 0, image.Length);
+            Array.Copy(file, entry, group, 6 + i * 14, 12);
+            group[6 + i * 14 + 12] = (byte)(i + 1);
+            if (!UpdateResourceW(h, (IntPtr)3, (IntPtr)(i + 1), 0, image, (uint)image.Length)) throw new Win32Exception();
+        }
+        if (!UpdateResourceW(h, (IntPtr)14, (IntPtr)1, 0, group, (uint)group.Length)) throw new Win32Exception();
+        if (!EndUpdateResourceW(h, false)) throw new Win32Exception();
+    }
+}
+'@
+[ExeIcon]::Set($appPath, (Join-Path $PSScriptRoot 'assets\doodle_reef.ico'))
 $appImage = [IO.File]::ReadAllBytes($appPath)
 $peOffset = [BitConverter]::ToInt32($appImage, 60)
 if ([BitConverter]::ToUInt16($appImage, $peOffset + 24 + 68) -ne 2) { throw 'The executable still requests a console.' }
