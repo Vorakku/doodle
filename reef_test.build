@@ -1,0 +1,1 @@
+c_sources = ["platform/image_file.c"];

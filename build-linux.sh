@@ -29,9 +29,9 @@ for name in xdg_wm_base xdg_positioner xdg_surface xdg_toplevel xdg_popup; do
     protocol_names+=("-D${name}_interface=reef_${name}_interface")
 done
 
-compile() { # SOURCE.goose OUTPUT
+compile() { # SOURCE.goose OUTPUT [CFLAGS...]
     "$goose_bin" -O2 --standalone -o "$2.c" "$1"
-    "${CC:-cc}" -O2 "$2.c" platform/wallpaper_wayland.c \
+    "${CC:-cc}" -O2 "${@:3}" "$2.c" platform/wallpaper_wayland.c platform/image_file.c platform/image_dialog.c \
         build/wayland/wlr-layer-shell-protocol.c build/wayland/xdg-shell-protocol.c \
         -Ibuild/wayland "${includes[@]}" "${protocol_names[@]}" \
         -Wl,--wrap=SDL_CreateWindow -Wl,--start-group @build/link.rsp -Wl,--end-group \
@@ -41,7 +41,7 @@ compile() { # SOURCE.goose OUTPUT
 if [[ "${1:-}" == --test ]]; then
     "$goose_bin" reef_test.goose --debug
     mkdir -p .test-data
-    compile reef_ui_test.goose .test-data/reef_ui_test
+    compile reef_ui_test.goose .test-data/reef_ui_test -DREEF_IMPORT_TESTS
     GOOSE_GFX_HEADLESS=1 .test-data/reef_ui_test
     echo 'Model and UI checks passed.'
 fi

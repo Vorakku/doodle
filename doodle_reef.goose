@@ -10,6 +10,9 @@ import canvas_view;
 import reef_fill;
 import reef_color;
 import reef_shapes;
+import reef_growth;
+import reef_image_data;
+import reef_images;
 
 let FONT: const u8[:] = embed_file("assets/Roboto-Regular.ttf");
 let PALETTE: u8[4][6] = [[255, 190, 108, 255], [255, 126, 140, 255],
@@ -27,8 +30,12 @@ fn text(ctx: ui::Context, x: f32, y: f32, w: f32, message: const u8[:], c: ui::C
                   ui::rgba(0, 0, 0, 0), c);
 }
 
-// The body bends harder while turning.
-fn wave_height(facing: f32) -> f32 { return 3.0 + (1.0 - abs(facing)) * 5.0; }
+fn fish_label(ctx: ui::Context, center: f32, y: f32, message: const u8[:], c: ui::Color) {
+    let width = ceil(ui::text_width(ui::font(ctx), message)) + 4.0;
+    let x = center - width * 0.5;
+    text(ctx, x + 1.0, y + 1.0, width, message, ui::rgb(4, 20, 26));
+    text(ctx, x, y, width, message, c);
+}
 
 // Pieces share fixed positions along the drawing, so every row bends with the swim wave identically and no seam opens.
 fn draw_fill_row(ctx: ui::Context, x0: f32, x1: f32, y: f32, height: f32, b: Bounds, scale: f32, ox: f32, oy: f32,
@@ -44,6 +51,27 @@ fn draw_fill_row(ctx: ui::Context, x0: f32, x1: f32, y: f32, height: f32, b: Bou
         let along0 = (start - b.x - b.w * 0.5) * scale;
         let along1 = (end - b.x - b.w * 0.5) * scale;
         let middle = ox + b.w * scale * 0.5;
+        if swim {
+            let down = (y - b.y - b.h * 0.5) * scale;
+            let wave0 = sin(phase + (start - b.x) / b.w * 3.0) * wave_height(turn.across);
+            let wave1 = sin(phase + (end - b.x) / b.w * 3.0) * wave_height(turn.across);
+            let ax, ay, an = body_point(turn, along0, down + wave0);
+            let bx, by, bn = body_point(turn, along1, down + wave1);
+            let cx, cy, cn = body_point(turn, along1, down + wave1 + height);
+            let dx, dy, dn = body_point(turn, along0, down + wave0 + height);
+            let middle_y = oy + b.h * scale * 0.5;
+            var quad: float2[4] = [float2 { middle + ax, middle_y + ay }, float2 { middle + bx, middle_y + by },
+                                   float2 { middle + cx, middle_y + cy }, float2 { middle + dx, middle_y + dy }];
+            // Nuklear's anti-aliasing needs the same winding after the left/right mirror.
+            if turn.across > 0.0 {
+                quad[1] = float2 { middle + dx, middle_y + dy };
+                quad[3] = float2 { middle + bx, middle_y + by };
+            }
+            ui::fill_polygon(ctx, quad, c);
+            start = end;
+            piece++;
+            continue;
+        }
         let edge0 = middle + along0 * turn.across * turn_nearness(turn, along0);
         let edge1 = middle + along1 * turn.across * turn_nearness(turn, along1);
         let sx0 = floor(min(edge0, edge1));
@@ -86,11 +114,14 @@ fn draw_fills(ctx: ui::Context, points: const Point[:], b: Bounds, scale: f32, o
 
 fn draw_points(ctx: ui::Context, points: const Point[:], area: ui::Rect,
                phase: f32, swim: bool, heading: f32,
+               pitch: f32 = 0.0,
                document: Bounds = Bounds { 0.0, 0.0, 1.0, 1.0 },
                clip: Bounds = Bounds { 0.0, 0.0, 16384.0, 16384.0 }) {
     let b = if swim { drawing_bounds(points) } else { document };
-    let scale = min(area.w / b.w, area.h / b.h);
-    let turn = turn_view(heading, area.w);
+    let turn = turn_view(heading, area.w, if swim { pitch } else { 0.0 });
+    // Fit the rotated artwork inside its existing selection and drag area.
+    let scale = min(area.w / (b.w * abs(turn.tilt_cos) + b.h * abs(turn.tilt_sin)),
+                    area.h / (b.w * abs(turn.tilt_sin) + b.h * abs(turn.tilt_cos)));
     let ox = area.x + (area.w - b.w * scale) * 0.5;
     let oy = area.y + (area.h - b.h * scale) * 0.5;
     draw_fills(ctx, points, b, scale, ox, oy, phase, swim, turn, clip);
@@ -98,10 +129,11 @@ fn draw_points(ctx: ui::Context, points: const Point[:], area: ui::Rect,
     for p in points {
         if fill_row_height(p.width) > 0.0 { continue; }
         let along = (p.x - b.x - b.w * 0.5) * scale;
-        let near = turn_nearness(turn, along);
-        let x = ox + b.w * scale * 0.5 + along * turn.across * near;
-        let y = oy + b.h * scale * 0.5 + near * ((p.y - b.y - b.h * 0.5) * scale +
-            (if swim { sin(phase + (p.x - b.x) / b.w * 3.0) * wave_height(turn.across) } else { 0.0 }));
+        let down = (p.y - b.y - b.h * 0.5) * scale +
+            (if swim { sin(phase + (p.x - b.x) / b.w * 3.0) * wave_height(turn.across) } else { 0.0 });
+        let px, py, near = body_point(turn, along, down);
+        let x = ox + b.w * scale * 0.5 + px;
+        let y = oy + b.h * scale * 0.5 + py;
         // Whole pixels, because line widths get truncated and would come out thinner than the round joints.
         let width = max(1.0, round(p.width * scale * near));
         if !p.start {
@@ -239,8 +271,8 @@ fn used_colors(points: const Point[:]) -> u8[4][>..] {
     return found;
 }
 
-fn scene(ctx: ui::Context, w: f32, h: f32, time: f32, reef: const Creature[:], headings: const f32[:], selected_fish: i64,
-         wallpaper: bool = false) {
+fn scene(ctx: ui::Context, w: f32, h: f32, time: f32, reef: const Creature[:], headings: const f32[:], motions: const SwimMotion[:], selected_fish: i64, images: ImageRenderer&,
+         wallpaper: bool = false, names: bool = false) {
     let bounds = ui::rect(0.0, 0.0, w, h);
     ui::window_set_bounds(ctx, "Water", bounds);
     if ui::begin(ctx, "Water", bounds, ui::WINDOW_BACKGROUND | ui::WINDOW_NO_INPUT | ui::WINDOW_NO_SCROLLBAR) {
@@ -286,7 +318,34 @@ fn scene(ctx: ui::Context, w: f32, h: f32, time: f32, reef: const Creature[:], h
                 let area = creature_area(fish, w, h);
                 let box = ui::rect(area.x, area.y, area.w, area.h);
                 if i == selected_fish { ui::stroke_rect(ctx, box, 10.0, 2.0, ui::rgb(129, 218, 195)); }
-                draw_points(ctx, fish.points, box, fish.phase, true, headings[i]);
+                if fish.image_id == 0 { draw_points(ctx, fish.points, box, fish.phase, true, headings[i], motions[i].pitch); }
+                else {
+                    let pose = if i < images.slots.len {
+                        render_image_pose(images, images.slots[i], box.w, box.h, fish.phase, true, headings[i], motions[i].pitch, fish.image_flip)
+                    } else { gfx::Texture { 0 } };
+                    if pose.id != 0 {
+                        ui::draw_image(ctx, ui::rect(box.x - 8.0, box.y - 8.0, box.w + 16.0, box.h + 16.0),
+                            ui::texture_image(pose), ui::rgb(255, 255, 255));
+                    } else {
+                        ui::stroke_rect(ctx, box, 2.0, 1.0, ui::rgb(129, 218, 195));
+                        ui::stroke_line(ctx, box.x, box.y, box.x + box.w, box.y + box.h, 1.0, ui::rgb(129, 218, 195));
+                    }
+                }
+            }
+        }
+        // After every fish, so no fish hides a label.
+        if names {
+            for i in reef.len {
+                let fish .= reef[i];
+                if fish.name.len == 0 { continue; }
+                let area = creature_area(fish, w, h);
+                let center = area.x + area.w * 0.5;
+                // Always leaves room for the tier above the footer, so selecting never moves the name.
+                let y = min(area.y + area.h + 2.0, h - 114.0);
+                fish_label(ctx, center, y, fish.name, ui::rgb(232, 244, 240));
+                if i == selected_fish && fish.tier >= 0 {
+                    fish_label(ctx, center, y + 18.0, str("Tier ", TIER_NAMES[fish.tier]), ui::rgb(129, 218, 195));
+                }
             }
         }
         if !wallpaper { text(ctx, 26.0, h - 32.0, w - 52.0, "A little ocean. Entirely yours.", ui::rgb(42, 61, 58)); }
@@ -303,6 +362,8 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
     var reef: Creature[>..] = [];
     var status: u8[>..] = [];
     var known_image: u8[>..] = [];
+    var growth_random = rng { random_seed() };
+    var needs_growth = false;
     var save_ok = !wallpaper && make_dir(directory);
     if file_exists(save_path) {
         var raw: u8[>..] = [];
@@ -311,20 +372,21 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
             let loaded, ok = decode_reef(raw);
             if ok {
                 reef.append(loaded);
-                let backup = str(save_path, ".v1.bak");
-                if !wallpaper && raw.len >= 8 && raw[..8] == LEGACY_SAVE_HEADER && !file_exists(backup) {
-                    if !write_file_atomic(backup, raw) {
-                        save_ok = false;
-                        status.append("Could not back up the older save. Saving disabled to protect your drawings.");
-                    }
-                }
+                needs_growth = raw[..8] != SAVE_HEADER;
             }
             else { save_ok = false; status.append("Save could not be read. Original file preserved; saving disabled."); }
         } else { save_ok = false; status.append("Cannot read save. Saving disabled to protect your drawings."); }
     }
     if !wallpaper && !save_ok && status.len == 0 { status.append("Cannot create data folder. Saving is unavailable."); }
     if wallpaper && status.len > 0 { write_stderr(str(status, "\n")); }
-    if reef.len == 0 && !file_exists(save_path) { reef.push(demo()); }
+    if reef.len == 0 && !file_exists(save_path) { reef.push(demo()); needs_growth = true; }
+    if needs_growth {
+        if wallpaper { write_stderr("Open the updated editor once to upgrade this aquarium's saved metadata.\n"); }
+        else if save_ok && !upgrade_growth(reef, save_path, known_image, time(), growth_random) {
+            save_ok = false;
+            status.clear(); status.append("Could not back up or upgrade saved fish. Original preserved; saving disabled.");
+        }
+    }
     if wallpaper && !reef_wallpaper_prepare(output) { exit(1); }
     guard gfx::open("DOODLE REEF", 1100, 760, gfx::WINDOW_RESIZABLE) else {
         if wallpaper { reef_wallpaper_stop(); }
@@ -359,6 +421,16 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
     var picking_color = false;
     var hex_text: u8[..6] = [];
     var hex_editing = false;
+    var naming = false;
+    var naming_focus = false;
+    var fish_name: u8[..128] = [];
+    var name_error: u8[>..] = [];
+    var imported = ImageData {};
+    var imported_png: u8[>..] = [];
+    var imported_slot = ImageSlot {};
+    var images = ImageRenderer {};
+    var import_pending = false;
+    var clear_image_slot = false;
     var shape_active = false;
     var shape_x: f32 = 0.0;
     var shape_y: f32 = 0.0;
@@ -375,8 +447,9 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
     var canvas_aspect: f32 = 0.0;
     var canvas_extent: f32 = 1100.0;
     var panning = false;
-    var time: f32 = 0.0;
+    var swim_time: f32 = 0.0;
     var headings: f32[>..] = [];
+    var motions: SwimMotion[>..] = [];
     var drawn = 0;
     var next_reload = clock() + 1.0;
     loop {
@@ -398,17 +471,41 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
         let screen = gfx::screen_size();
         let w = screen.x as f32;
         let h = screen.y as f32;
+        if import_pending {
+            var chosen_path: u8[4096] = [0; 4096];
+            let chosen = reef_image_dialog_result(chosen_path);
+            if chosen != 0 {
+                import_pending = false;
+                if chosen > 0 {
+                    let image, png, error = load_png_image(chosen_path[..chosen], directory);
+                    status.clear();
+                    if error.len > 0 { status.append(error); }
+                    else if !prepare_image_slot(imported_slot, image) { status.append("Cannot prepare the image for display."); }
+                    else {
+                        imported = copy(image); imported_png = copy(png);
+                        canvas_view = CanvasView {}; canvas_aspect = 0.0;
+                        drawing = false; shape_active = false; panning = false;
+                        status.append("Image ready. Bring it to life to name and save it.");
+                    }
+                } else if chosen == -2 { status.clear(); status.append("The image picker could not open the selected path."); }
+            }
+        }
+        var cancel_naming = false;
         if !wallpaper {
             ui::input_from_gfx(ctx);
             if gfx::key_pressed("Escape") {
-                studio = false; drawing = false;
-                if selected_fish >= 0 && save_ok { status.clear(); }
-                selected_fish = -1; dragging_fish = -1;
+                if naming { cancel_naming = true; }
+                else {
+                    studio = false; drawing = false;
+                    if selected_fish >= 0 && save_ok { status.clear(); }
+                    selected_fish = -1; dragging_fish = -1;
+                }
             }
             if gfx::key_pressed("Space") && !studio { paused = !paused; }
             let toolbar = ui::rect(20.0, 18.0, max(260.0, w - 40.0), 64.0);
             ui::window_set_bounds(ctx, "Controls", toolbar);
             if ui::begin(ctx, "Controls", toolbar, ui::WINDOW_NO_SCROLLBAR) {
+                if naming || import_pending { ui::widget_disable_begin(ctx); }
                 let ratios: f32[4] = [0.4, 0.27, 0.16, 0.17];
                 ui::layout_row(ctx, ui::DYNAMIC, 42.0, ratios);
                 if background_button {
@@ -428,6 +525,7 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                 if ui::button_label(ctx, "Reset swim") {
                     for i in reef.len { reef[i].x = 0.2 + (i % 5) * 0.14; reef[i].phase = 0.0; }
                 }
+                if naming || import_pending { ui::widget_disable_end(ctx); }
             }
             ui::end(ctx);
 
@@ -467,7 +565,7 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     let state, slot = ui::widget(ctx);
                     viewport = Bounds { slot.x, slot.y, slot.w, slot.h };
                     let mouse = ui::input_mouse(ctx);
-                    let over_view = mouse.pos.x >= viewport.x && mouse.pos.x <= viewport.x + viewport.w &&
+                    let over_view = !naming && !import_pending && mouse.pos.x >= viewport.x && mouse.pos.x <= viewport.x + viewport.w &&
                                     mouse.pos.y >= viewport.y && mouse.pos.y <= viewport.y + viewport.h;
                     let down = ui::input_is_mouse_down(ctx, ui::BUTTON_LEFT);
                     let pressed = ui::input_is_mouse_pressed(ctx, ui::BUTTON_LEFT);
@@ -490,7 +588,7 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                                  mouse.pos.y >= canvas.y && mouse.pos.y <= canvas.y + canvas.h;
                     let doc_x = (mouse.pos.x - canvas.x) / canvas.w * document.w;
                     let doc_y = (mouse.pos.y - canvas.y) / canvas.h * document.h;
-                    let can_use = inside && state == ui::WIDGET_VALID;
+                    let can_use = inside && state == ui::WIDGET_VALID && imported.rgba.len == 0;
                     var shape_end_x = clamp(doc_x, 0.0, document.w);
                     var shape_end_y = clamp(doc_y, 0.0, document.h);
                     if tool != Tool.Line && (gfx::key_down("Left Shift") || gfx::key_down("Right Shift")) {
@@ -550,10 +648,14 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     let ink_clip = intersect_area(canvas, viewport);
                     ui::push_scissor(ctx, ui::rect(ink_clip.x, ink_clip.y, ink_clip.w, ink_clip.h));
                     let canvas_box = ui::rect(canvas.x, canvas.y, canvas.w, canvas.h);
-                    draw_points(ctx, points[..visible], canvas_box, 0.0, false, 1.0, document, ink_clip);
+                    if imported.rgba.len > 0 {
+                        let pose = render_image_pose(images, imported_slot, canvas_box.w, canvas_box.h, 0.0, false, 1.0, 0.0, false);
+                        if pose.id != 0 { ui::draw_image(ctx, ui::rect(canvas_box.x - 8.0, canvas_box.y - 8.0,
+                            canvas_box.w + 16.0, canvas_box.h + 16.0), ui::texture_image(pose), ui::rgb(255, 255, 255)); }
+                    } else { draw_points(ctx, points[..visible], canvas_box, 0.0, false, 1.0, 0.0, document, ink_clip); }
                     if shape_active {
                         draw_points(ctx, shape_points(tool, shape_x, shape_y, shape_end_x, shape_end_y, brush_width, ink),
-                                    canvas_box, 0.0, false, 1.0, document, ink_clip);
+                                    canvas_box, 0.0, false, 1.0, 0.0, document, ink_clip);
                     }
                 }
                 ui::end(ctx);
@@ -617,41 +719,110 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     ui::label(ctx, "Middle drag / Space + drag", ui::TEXT_LEFT);
                     ui::layout_row_dynamic(ctx, 30.0, 3);
                     // Not mid-stroke, where the next mouse sample would bring the undone points straight back.
-                    let shortcuts = (gfx::key_down("Left Ctrl") || gfx::key_down("Right Ctrl")) && !drawing && !shape_active && !ui::wants_keyboard(ctx);
+                    let shortcuts = (gfx::key_down("Left Ctrl") || gfx::key_down("Right Ctrl")) && !drawing && !shape_active && !naming && !import_pending && imported.rgba.len == 0 && !ui::wants_keyboard(ctx);
+                    if imported.rgba.len > 0 || import_pending { ui::widget_disable_begin(ctx); }
                     let undo_clicked = ui::button_label(ctx, "Undo");
                     let redo_clicked = ui::button_label(ctx, "Redo");
+                    if imported.rgba.len > 0 || import_pending { ui::widget_disable_end(ctx); }
                     if (undo_clicked || (shortcuts && gfx::key_pressed("Z"))) && visible > 0 { visible = undo_position(points, visible, fills); }
                     if (redo_clicked || (shortcuts && gfx::key_pressed("Y"))) && visible < points.len { visible = redo_position(points, visible, fills); }
                     if ui::button_label(ctx, "Clear") {
                         points.resize(0); fills.clear(); visible = 0; canvas_aspect = 0.0; canvas_view = CanvasView {}; drawing = false; shape_active = false;
+                        imported = ImageData {}; imported_png.clear(); clear_image_slot = true;
                     }
-                    ui::layout_row_dynamic(ctx, 38.0, 1);
-                    if visible == 0 || reef.len >= MAX_CREATURES || !save_ok { ui::widget_disable_begin(ctx); }
+                    let release_ratios: f32[2] = [0.66, 0.34];
+                    ui::layout_row(ctx, ui::DYNAMIC, 38.0, release_ratios);
+                    let has_art = visible > 0 || imported.rgba.len > 0;
+                    if !has_art || reef.len >= MAX_CREATURES || !save_ok || import_pending { ui::widget_disable_begin(ctx); }
                     let release = ui::button_label(ctx, "Bring to Life");
-                    if visible == 0 || reef.len >= MAX_CREATURES || !save_ok { ui::widget_disable_end(ctx); }
-                    if release && visible > 0 && reef.len < MAX_CREATURES && save_ok {
-                        var fish = Creature { x: 0.3, y: 0.25 + (reef.len % 4) * 0.15,
-                            speed: 0.035 + (reef.len % 5) * 0.009, phase: 0.0, points: [] };
-                        fish.points.append(points[..visible]);
-                        let ink_bounds = drawing_bounds(fish.points);
-                        fish.size = min(1.0, max(ink_bounds.w, ink_bounds.h));
-                        reef.push(fish);
-                        if write_file_atomic(save_path, encode_reef(reef)) {
-                            points.resize(0); fills.clear(); visible = 0; studio = false; paused = false;
-                            canvas_aspect = 0.0; canvas_view = CanvasView {}; drawing = false; panning = false;
-                            status.clear(); status.append("Your doodle is swimming. Saved on this computer.");
+                    if !has_art || reef.len >= MAX_CREATURES || !save_ok || import_pending { ui::widget_disable_end(ctx); }
+                    let can_import = points.len == 0 && imported.rgba.len == 0 && !naming && !import_pending && save_ok && reef.len < MAX_CREATURES;
+                    let import_hover = ui::input_is_mouse_hovering_rect(ctx, ui::widget_bounds(ctx));
+                    if !can_import { ui::widget_disable_begin(ctx); }
+                    let import_clicked = ui::button_label(ctx, "Import");
+                    if !can_import { ui::widget_disable_end(ctx); }
+                    if import_clicked && can_import {
+                        import_pending = reef_image_dialog_open();
+                        if !import_pending { status.clear(); status.append("The image picker could not be opened."); }
+                    }
+                    if release && has_art && reef.len < MAX_CREATURES && save_ok {
+                        naming = true; naming_focus = true; fish_name.clear(); name_error.clear();
+                        drawing = false; shape_active = false; panning = false;
+                    }
+                    if naming {
+                        let popup_w = min(380.0, w - 40.0);
+                        let popup = ui::rect((w - popup_w) * 0.5 - tools.x, (h - 210.0) * 0.5 - tools.y, popup_w, 210.0);
+                        if ui::popup_begin(ctx, ui::POPUP_STATIC, "Name your fish",
+                                           ui::WINDOW_BORDER | ui::WINDOW_TITLE | ui::WINDOW_NO_SCROLLBAR, popup) {
+                            ui::layout_row_dynamic(ctx, 24.0, 1);
+                            ui::label(ctx, "Give your new fish a name", ui::TEXT_LEFT);
+                            ui::layout_row_dynamic(ctx, 30.0, 1);
+                            if naming_focus && !ui::input_is_mouse_down(ctx, ui::BUTTON_LEFT) &&
+                               !ui::input_is_mouse_released(ctx, ui::BUTTON_LEFT) {
+                                ui::edit_focus(ctx, ui::EDIT_FIELD); naming_focus = false;
+                            }
+                            let edit = ui::edit_string(ctx, ui::EDIT_FIELD | ui::EDIT_SIG_ENTER, fish_name, ui::FILTER_DEFAULT);
+                            let named = valid_name(fish_name);
+                            ui::layout_row_dynamic(ctx, 24.0, 1);
+                            ui::label(ctx, if name_error.len > 0 { name_error } else { "1-32 characters. Cancel keeps your drawing." }, ui::TEXT_LEFT);
+                            ui::layout_row_dynamic(ctx, 34.0, 2);
+                            let cancel = ui::button_label(ctx, "Cancel") || cancel_naming;
+                            if !named { ui::widget_disable_begin(ctx); }
+                            let confirm = ui::button_label(ctx, "Bring to Life") || ((edit & ui::EDIT_COMMITTED) != 0 && named);
+                            if !named { ui::widget_disable_end(ctx); }
+                            if cancel {
+                                naming = false; fish_name.clear(); name_error.clear();
+                                ui::edit_unfocus(ctx); ui::popup_close(ctx);
+                            } else if confirm && named && has_art && reef.len < MAX_CREATURES && save_ok {
+                                var new_image_id: u64 = 0;
+                                var asset_ok = true;
+                                if imported.rgba.len > 0 {
+                                    let id, ok = save_image(directory, imported, imported_png, growth_random);
+                                    new_image_id = id; asset_ok = ok;
+                                }
+                                if !asset_ok {
+                                    naming_focus = true; name_error.clear(); name_error.append("Could not save the image. Artwork kept; retry.");
+                                } else {
+                                var fish = Creature { x: 0.3, y: 0.25 + (reef.len % 4) * 0.15,
+                                    speed: 0.035 + (reef.len % 5) * 0.009, phase: 0.0, points: [],
+                                    tier: tier_from_roll(rand_int(growth_random, 100)), born: time(), name: [], image_id: new_image_id };
+                                fish.name.append(clean_name(fish_name));
+                                if new_image_id == 0 {
+                                    fish.points.append(points[..visible]);
+                                    let ink_bounds = drawing_bounds(fish.points);
+                                    fish.size = min(1.0, max(ink_bounds.w, ink_bounds.h));
+                                }
+                                reef.push(fish);
+                                if write_file_atomic(save_path, encode_reef(reef)) {
+                                    points.resize(0); fills.clear(); visible = 0; studio = false; paused = false;
+                                    imported = ImageData {}; imported_png.clear(); clear_image_slot = true;
+                                    canvas_aspect = 0.0; canvas_view = CanvasView {}; drawing = false; panning = false;
+                                    status.clear(); status.append(str(fish.name, " is swimming. Saved on this computer."));
+                                    naming = false; fish_name.clear(); name_error.clear();
+                                    ui::edit_unfocus(ctx); ui::popup_close(ctx);
+                                } else {
+                                    reef.resize(reef.len - 1);
+                                    discard_new_image(directory, new_image_id);
+                                    naming_focus = true;
+                                    name_error.clear(); name_error.append("Could not save. Your artwork is kept; retry.");
+                                }
+                                }
+                            }
+                            ui::popup_end(ctx);
                         } else {
-                            reef.resize(reef.len - 1);
-                            status.clear(); status.append("Could not save. Your drawing is still on the canvas; try again.");
+                            naming = false; ui::edit_unfocus(ctx);
                         }
                     }
                     ui::layout_row_dynamic(ctx, 24.0, 1);
                     let canvas_status: u8[>..] = if reef.len >= MAX_CREATURES { "Reef is full (12 creatures)." }
+                        else if import_hover && (points.len > 0 || imported.rgba.len > 0) { "Clear the canvas to import a PNG." }
+                        else if import_hover { "Import a transparent PNG." }
+                        else if imported.rgba.len > 0 { "Image preview. Clear to draw instead." }
                         else if visible == MAX_POINTS { "Canvas is full. Undo, clear, or Bring to Life." }
                         else { str(visible, " / ", MAX_POINTS, " drawing points") };
                     ui::label(ctx, canvas_status, ui::TEXT_LEFT);
                     ui::layout_row_dynamic(ctx, 22.0, 1);
-                    ui::label(ctx, "Bigger drawing, bigger creature.", ui::TEXT_LEFT);
+                    ui::label(ctx, "Tiny babies. Tier sets adult size.", ui::TEXT_LEFT);
                 }
                 ui::end(ctx);
             } else { shape_active = false; picking_color = false; }
@@ -666,8 +837,12 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                     let ratios: f32[3] = [0.56, 0.22, 0.22];
                     ui::layout_row(ctx, ui::DYNAMIC, 24.0, ratios);
                 } else { ui::layout_row_dynamic(ctx, 24.0, 1); }
-                let footer_text: u8[>..] = if status.len > 0 { copy(status) } else {
-                    str(reef.len, " creatures / Click a creature to select / Space to pause") };
+                let footer_text: u8[>..] = if status.len > 0 { copy(status) } else if has_selection && reef[selected_fish].tier >= 0 {
+                    let fish .= reef[selected_fish];
+                    let progress = growth_progress(fish.tier, fish.born, time());
+                    str(fish.name, " / Tier ", TIER_NAMES[fish.tier], " / Growth ", floor(progress * 100.0) as! i64, "% / ",
+                        if progress >= 1.0 { "Adult" } else { "Growing" })
+                } else { str(reef.len, " creatures / Click a creature to select / Space to pause") };
                 ui::label(ctx, footer_text, ui::TEXT_LEFT);
                 if has_selection {
                     if !save_ok { ui::widget_disable_begin(ctx); }
@@ -690,7 +865,6 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
                 }
                 if save_ok {
                     status.clear();
-                    if selected_fish >= 0 { status.append(str("Creature ", selected_fish + 1, " selected. Drag, flip, or delete.")); }
                 }
             }
             if dragging_fish >= 0 {
@@ -725,20 +899,30 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
         // Creatures were added or removed, so positions no longer line up: settle everyone straight away.
         if headings.len != reef.len {
             headings.resize(0);
-            for fish in reef { headings.push(if fish.speed < 0.0 { 0.0 } else { 1.0 }); }
-        }
-        if !paused {
-            let before = time;
-            time += dt;
-            for i in reef.len {
-                headings[i] = step_heading(headings[i], reef[i].speed, dt);
-                if i != dragging_fish { update(reef[i], dt, turn_facing(headings[i])); maybe_turn(reef[i], i, before, time); }
+            motions.resize(0);
+            for fish in reef {
+                headings.push(if fish.speed < 0.0 { 0.0 } else { 1.0 });
+                motions.push(SwimMotion {});
             }
         }
-        scene(ctx, w, h, time, reef, headings, if studio || wallpaper { -1 } else { selected_fish }, wallpaper);
+        if !paused {
+            let before = swim_time;
+            swim_time += dt;
+            for i in reef.len {
+                headings[i] = step_heading(headings[i], reef[i].speed, dt);
+                if i != dragging_fish {
+                    swim(reef[i], motions[i], dt, turn_facing(headings[i]), i);
+                    update_pitch(reef[i], motions[i], dt, w, h);
+                    maybe_turn(reef[i], i, before, swim_time);
+                }
+            }
+        }
+        sync_image_slots(images, reef, directory);
+        scene(ctx, w, h, swim_time, reef, headings, motions, if studio || wallpaper { -1 } else { selected_fish }, images, wallpaper, !studio && !wallpaper);
         gfx::begin_screen(float4 { 0.03, 0.1, 0.14, 1.0 });
         gfx::end_pass();
         ui::render(ctx);
+        if clear_image_slot { release_image_slot(imported_slot); clear_image_slot = false; }
         if wallpaper { ui::clear(ctx); }
         drawn++;
         if drawn == frames {
@@ -747,6 +931,8 @@ fn run<FRAME>(directory: const u8[:], frames: i64, initial_studio: bool,
         }
         sleep(max(0.0, 1.0 / fps - (clock() - started)));
     }
+    release_image_slot(imported_slot);
+    release_image_renderer(images);
     ui::destroy(ctx);
     if wallpaper { reef_wallpaper_stop(); }
     gfx::close();

@@ -13,6 +13,10 @@ fi
 mkdir -p -- "$data_dir"
 # Preserve a portable reef when first moving this project from Windows to Linux.
 if [[ ! -e "$data_dir/creatures.reef" && -f "$project_dir/build/data/creatures.reef" ]]; then
+    # Images first: an interrupted copy leaves no creatures.reef, so the next launch retries.
+    if [[ -d "$project_dir/build/data/images" ]]; then
+        cp -r -- "$project_dir/build/data/images" "$data_dir/"
+    fi
     cp -n -- "$project_dir/build/data/creatures.reef" "$data_dir/creatures.reef"
 fi
 exec "$binary" --data-dir "$data_dir" "$@"

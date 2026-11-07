@@ -24,6 +24,20 @@ if (-not $SkipTests) {
 }
 & $compiler build doodle_reef.goose -o build/doodle_reef.exe
 if ($LASTEXITCODE -ne 0) { throw 'Goose build failed.' }
+$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+$editbin = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\editbin.exe' | Select-Object -First 1
+if (-not $editbin) { throw 'Visual Studio editbin.exe was not found.' }
+$appPath = Join-Path $PSScriptRoot 'build\doodle_reef.exe'
+& $editbin /NOLOGO /SUBSYSTEM:WINDOWS $appPath
+if ($LASTEXITCODE -ne 0) { throw 'Could not configure the Windows GUI executable.' }
+$appImage = [IO.File]::ReadAllBytes($appPath)
+$peOffset = [BitConverter]::ToInt32($appImage, 60)
+if ([BitConverter]::ToUInt16($appImage, $peOffset + 24 + 68) -ne 2) { throw 'The executable still requests a console.' }
+
+$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $PSScriptRoot 'Doodle Reef.lnk'))
+$shortcut.TargetPath = $appPath
+$shortcut.WorkingDirectory = $PSScriptRoot
+$shortcut.Save()
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'platform\set-background-windows.ps1') -Destination (Join-Path $PSScriptRoot 'build\set-background-windows.ps1') -Force
 
 $packageDir = Join-Path $PSScriptRoot 'build\lively'

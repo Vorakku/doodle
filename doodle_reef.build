@@ -1,3 +1,4 @@
 c_sources_windows = ["platform/wallpaper_windows.c"];
 c_libs_windows = ["user32"];
 // Linux uses build-linux.sh to wrap SDL_CreateWindow at link time.
+c_sources = ["platform/image_file.c", "platform/image_dialog.c"];
